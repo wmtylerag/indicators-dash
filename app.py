@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import json
 import os
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -16,8 +18,13 @@ import streamlit as st
 APP_TITLE = "South Korea Macro Dashboard"
 FETCH_START = "1989-01"  # one extra year so y/y changes exist from Jan 1990
 DEFAULT_START = "1990-01"
-CACHE_TTL_SECONDS = 12 * 60 * 60  # data are cached 12h unless the user refreshes
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refresh_log.csv")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(APP_DIR, "refresh_log.csv")
+DATA_FILE = os.path.join(APP_DIR, "data_snapshot.json")  # last successful download, reused across restarts
+# Automatic refresh interval (default: weekly). Override with env var, e.g. REFRESH_INTERVAL_DAYS=1
+REFRESH_INTERVAL = timedelta(days=float(os.environ.get("REFRESH_INTERVAL_DAYS", "7")))
+SCHEDULER_CHECK_SECONDS = 60 * 60  # background thread checks hourly whether a refresh is due
+SESSION_POLL = "15m"  # open browser tabs check this often for newer data and redraw
 HTTP_TIMEOUT = 60
 USER_AGENT = "korea-macro-dashboard/1.0 (streamlit; python-requests)"
 
@@ -158,9 +165,8 @@ def fetch_wb(url: str) -> pd.DataFrame:
 FETCHERS = {"imf": fetch_imf, "oecd": fetch_oecd, "wb": fetch_wb}
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def load_all_raw() -> tuple[dict, dict, str]:
-    """Download every raw series. Returns (series dict, status dict, UTC fetch time)."""
+def download_all() -> tuple[dict, dict]:
+    """Download every raw series. Returns (series dict, status dict)."""
     data, status = {}, {}
     for key, meta in RAW_SOURCES.items():
         try:
@@ -176,11 +182,131 @@ def load_all_raw() -> tuple[dict, dict, str]:
                 "error": "",
             }
         except Exception as exc:  # noqa: BLE001 - surface any failure in the UI/log
-            data[key] = pd.DataFrame({"period": pd.Series(dtype=str), "value": pd.Series(dtype=float),
-                                      "date": pd.Series(dtype="datetime64[ns]")})
+            data[key] = _empty_series()
             status[key] = {"ok": False, "rows": 0, "first": "", "latest": "", "error": str(exc)[:300]}
-    fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return data, status, fetched_at
+    return data, status
+
+
+def _empty_series() -> pd.DataFrame:
+    return pd.DataFrame({"period": pd.Series(dtype=str), "value": pd.Series(dtype=float),
+                         "date": pd.Series(dtype="datetime64[ns]")})
+
+
+# ---- Persistent snapshot + weekly scheduler ------------------------------------------
+# The latest download is saved to DATA_FILE so that every visitor, every browser tab and
+# every server restart share the same data, and so the app knows when it last refreshed.
+_REFRESH_LOCK = threading.Lock()
+_MEMO: dict = {}  # in-process copy of the snapshot (also used if the disk is read-only)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _fmt(ts: datetime) -> str:
+    return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _save_snapshot(snap: dict) -> None:
+    _MEMO["snap"] = snap
+    payload = {
+        "fetched_at": snap["fetched_at"].isoformat(),
+        "trigger": snap["trigger"],
+        "status": snap["status"],
+        "data": {k: {"period": df["period"].tolist(), "value": df["value"].tolist()}
+                 for k, df in snap["data"].items()},
+    }
+    try:
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, DATA_FILE)  # atomic swap so readers never see a half-written file
+    except OSError:
+        pass
+
+
+def _load_snapshot_from_disk() -> dict | None:
+    try:
+        with open(DATA_FILE, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        data = {}
+        for k, d in payload["data"].items():
+            df = pd.DataFrame({"period": d["period"], "value": d["value"]})
+            df["date"] = df["period"].map(_period_to_timestamp) if len(df) else pd.Series(dtype="datetime64[ns]")
+            data[k] = df if len(df) else _empty_series()
+        for k in RAW_SOURCES:  # a series added to RAW_SOURCES after the snapshot was written
+            data.setdefault(k, _empty_series())
+        return {"fetched_at": datetime.fromisoformat(payload["fetched_at"]), "trigger": payload["trigger"],
+                "status": payload["status"], "data": data}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def current_snapshot() -> dict | None:
+    memo = _MEMO.get("snap")
+    disk = None
+    if os.path.exists(DATA_FILE):
+        mtime = os.path.getmtime(DATA_FILE)
+        if memo is None or _MEMO.get("mtime") != mtime:
+            disk = _load_snapshot_from_disk()
+            if disk is not None:
+                _MEMO["mtime"] = mtime
+                _MEMO["snap"] = disk
+    return disk or memo
+
+
+def refresh_now(trigger: str, only_if_due: bool = False) -> dict:
+    """Download everything, save the snapshot and write a log entry.
+
+    With only_if_due=True, does nothing unless the saved data are older than REFRESH_INTERVAL
+    (re-checked under the lock so concurrent callers never download twice)."""
+    with _REFRESH_LOCK:
+        snap = current_snapshot()
+        if only_if_due and snap is not None and _utcnow() - snap["fetched_at"] < REFRESH_INTERVAL:
+            return snap
+        data, status = download_all()
+        n_ok = sum(1 for v in status.values() if v["ok"])
+        now = _utcnow()
+        if n_ok == 0 and snap is not None:
+            # Total outage: keep the previous data, log the failure, retry at the next check.
+            new = snap
+        else:
+            if snap is not None:  # keep the previous copy of any series that failed this time
+                for k, v in status.items():
+                    if not v["ok"] and snap["status"].get(k, {}).get("ok"):
+                        data[k] = snap["data"][k]
+                        status[k] = {**snap["status"][k], "error": f"refresh failed, showing data from "
+                                     f"{_fmt(snap['fetched_at'])}: {v['error']}"}
+            new = {"fetched_at": now, "trigger": trigger, "status": status, "data": data}
+            _save_snapshot(new)
+        append_log({
+            "logged_at_utc": _fmt(now),
+            "trigger": trigger,
+            "result": "updated" if new is not snap else "failed - previous data kept",
+            "sources_ok": f"{n_ok}/{len(status)}",
+            "next_scheduled_utc": _fmt(new["fetched_at"] + REFRESH_INTERVAL) if new is not snap
+                                  else _fmt(now + timedelta(seconds=SCHEDULER_CHECK_SECONDS)),
+            "latest_by_series": json.dumps({k: v["latest"] for k, v in status.items()}),
+            "errors": "; ".join(f"{k}: {v['error']}" for k, v in status.items() if v["error"]),
+        })
+        return new
+
+
+def _scheduler_loop() -> None:
+    while True:
+        try:
+            refresh_now("Scheduled weekly refresh (background)", only_if_due=True)
+        except Exception:  # noqa: BLE001 - never let the scheduler thread die
+            pass
+        time.sleep(SCHEDULER_CHECK_SECONDS)
+
+
+@st.cache_resource(show_spinner=False)
+def start_scheduler() -> threading.Thread:
+    """Start one background scheduler thread per server process (not per visitor)."""
+    t = threading.Thread(target=_scheduler_loop, name="weekly-refresh", daemon=True)
+    t.start()
+    return t
 
 
 # --------------------------------------------------------------------------------------
@@ -288,9 +414,17 @@ def metric_specs(rer_choice: str, rer_scale: str) -> list[dict]:
 # --------------------------------------------------------------------------------------
 # Refresh log
 # --------------------------------------------------------------------------------------
+_LOG_MEMO: list[dict] = []
+
+
 def append_log(entry: dict) -> None:
-    st.session_state.setdefault("refresh_log", []).insert(0, entry)
-    try:  # also persist to disk (best effort; read-only filesystems are ignored)
+    """Record a refresh. Safe to call from the background thread (no Streamlit calls)."""
+    _LOG_MEMO.insert(0, entry)
+    try:  # persist to disk (best effort; read-only filesystems fall back to memory)
+        if os.path.exists(LOG_FILE):  # a log from an older app version with other columns
+            with open(LOG_FILE, encoding="utf-8") as fh:
+                if fh.readline().strip() != ",".join(entry.keys()):
+                    os.replace(LOG_FILE, LOG_FILE.replace(".csv", f"_archived_{int(time.time())}.csv"))
         pd.DataFrame([entry]).to_csv(LOG_FILE, mode="a", index=False, header=not os.path.exists(LOG_FILE))
     except OSError:
         pass
@@ -300,9 +434,9 @@ def read_log() -> pd.DataFrame:
     if os.path.exists(LOG_FILE):
         try:
             return pd.read_csv(LOG_FILE).iloc[::-1].reset_index(drop=True)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - e.g. a log written by an older app version
             pass
-    return pd.DataFrame(st.session_state.get("refresh_log", []))
+    return pd.DataFrame(_LOG_MEMO)
 
 
 # --------------------------------------------------------------------------------------
@@ -342,6 +476,16 @@ def make_chart(df: pd.DataFrame, spec: dict) -> go.Figure:
 # --------------------------------------------------------------------------------------
 # App
 # --------------------------------------------------------------------------------------
+@st.fragment(run_every=SESSION_POLL)
+def _watch_for_new_data() -> None:
+    """Runs periodically in each open browser tab; redraws the page when the scheduler
+    has saved newer data, so a dashboard left open on a screen stays current."""
+    snap = current_snapshot()
+    shown = st.session_state.get("shown_fetched_at")
+    if snap is not None and shown is not None and snap["fetched_at"] > shown:
+        st.rerun(scope="app")
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
     st.title("🇰🇷 " + APP_TITLE)
@@ -351,31 +495,40 @@ def main() -> None:
     # ---- Sidebar: refresh + options ------------------------------------------------
     with st.sidebar:
         st.header("Data refresh")
-        refresh = st.button("🔄 Refresh data from APIs", width="stretch", type="primary")
-        st.caption(f"Without a manual refresh, downloaded data are cached for {CACHE_TTL_SECONDS // 3600} hours.")
+        refresh = st.button("🔄 Refresh data now", width="stretch", type="primary")
 
     if refresh:
-        load_all_raw.clear()
+        with st.spinner("Downloading data from IMF, OECD and World Bank…"):
+            snap = refresh_now("User refresh")
+        st.toast(f"Refresh finished at {_fmt(_utcnow())} — {read_log().iloc[0]['result']}")
+    else:
+        snap = current_snapshot()
+        if snap is None:
+            with st.spinner("First run: downloading data from IMF, OECD and World Bank…"):
+                snap = refresh_now("Initial download (no saved data)", only_if_due=True)
+        elif _utcnow() - snap["fetched_at"] >= REFRESH_INTERVAL:
+            # Catches up if the host was asleep when the background refresh was due.
+            with st.spinner("Data are more than a week old – refreshing…"):
+                snap = refresh_now("Scheduled weekly refresh (overdue at page load)", only_if_due=True)
 
-    with st.spinner("Downloading data from IMF, OECD and World Bank…"):
-        raw, status, fetched_at = load_all_raw()
+    start_scheduler()  # started after the first download so the two never overlap
+    raw, status = snap["data"], snap["status"]
+    fetched_at = _fmt(snap["fetched_at"])
+    next_due = snap["fetched_at"] + REFRESH_INTERVAL
+    st.session_state["shown_fetched_at"] = snap["fetched_at"]
 
-    if refresh or "refresh_log" not in st.session_state:
-        trigger = "User refresh" if refresh else "Initial load (session start)"
-        n_ok = sum(1 for s in status.values() if s["ok"])
-        entry = {
-            "logged_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "trigger": trigger,
-            "data_fetched_at_utc": fetched_at,
-            "sources_ok": f"{n_ok}/{len(status)}",
-            "latest_by_series": json.dumps({k: v["latest"] for k, v in status.items()}),
-            "errors": "; ".join(f"{k}: {v['error']}" for k, v in status.items() if not v["ok"]),
-        }
-        st.session_state.setdefault("refresh_log", [])
-        append_log(entry)
-        if refresh:
-            st.toast(f"Data refreshed at {entry['logged_at_utc']} ({entry['sources_ok']} sources OK)")
+    with st.sidebar:
+        interval_txt = ("weekly" if REFRESH_INTERVAL == timedelta(days=7)
+                        else f"every {REFRESH_INTERVAL.total_seconds() / 86400:g} days")
+        st.caption(f"**Auto-refresh:** {interval_txt}  \n"
+                   f"**Last refreshed:** {fetched_at} ({snap['trigger'].lower()})  \n"
+                   f"**Next automatic refresh:** {_fmt(max(next_due, _utcnow()))}")
+        _watch_for_new_data()
 
+    stale = {k: v for k, v in status.items() if v["ok"] and v["error"]}
+    if stale:
+        st.info("Latest refresh failed for some series; showing their previously downloaded data: " +
+                ", ".join(f"**{RAW_SOURCES[k]['label']}**" for k in stale))
     failed = {k: v for k, v in status.items() if not v["ok"]}
     if failed:
         st.warning("Some sources could not be loaded: " +
