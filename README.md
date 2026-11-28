@@ -1,6 +1,6 @@
 South Korea Macro Dashboard (Streamlit)
 
-An interactive, refreshable dashboard of six economic time series for the Republic of Korea. It goes back to January 1990 wherever the source has data that far. Every series comes from a free, public API with no key needed (IMF, OECD, World Bank).
+An interactive dashboard that refreshes itself weekly. It shows six economic time series for the Republic of Korea. It goes back to January 1990 wherever the source has data that far. Every series comes from a free, public API with no key needed (IMF, OECD, World Bank).
 
 #	Metric	Frequency	Units	Coverage*	Source
 1	Real exchange rate vs USD (KRW/USD)	Monthly	Index 2020 = 100 (default) or level	1990-01 →	Calculated from IMF ER + IMF CPI
@@ -28,11 +28,24 @@ Requirement	How it is met
 Choose a start and end month	Sidebar Start month / End month pickers (1990-01 to the latest month available)
 CSV of all observations and calculations in the period	Sidebar ⬇️ All observations (long CSV): one row per metric and period, with value, units, frequency, source and method. ⬇️ Raw inputs + calculations (wide monthly CSV): one row per month with every raw input and every calculated column
 CSV per chart	A ⬇️ CSV for this chart button under each chart
-Refreshable from free public APIs	Sidebar 🔄 Refresh data from APIs clears the cache and downloads everything again. Without a refresh, data are cached for 12 hours
+Refreshable from free public APIs	Sidebar 🔄 Refresh data now downloads everything again straight away
+Self-refresh weekly	The app downloads fresh data automatically every 7 days. See Automatic weekly refresh
 Units, frequency, source, latest observation on each chart	Shown above and below each chart. "Latest observation" is the newest data point the source has; "in selection" is the newest one inside your chosen period
 All sources, including for calculated metrics	Each chart lists every input series with its provider page and exact API query, plus the formula. Calculated metrics are marked (calculated metric)
-Timestamped log of refreshes	🕒 Refresh log expander: UTC timestamp, trigger (session start or user refresh), number of sources that loaded, latest period per series, and any errors. It is also written to refresh_log.csv next to app.py (best effort; hosted platforms may wipe this file on restart) and can be downloaded
-Graceful failure	If one API is down, the other charts still load and a warning names the failed source. 🔌 Source status shows the result for each series
+Timestamped log of refreshes	🕒 Refresh log expander: one row per download, with UTC timestamp, trigger (user refresh, scheduled weekly refresh, or first download), result, number of sources that loaded, next scheduled refresh, latest period per series, and any errors. It is also written to refresh_log.csv next to app.py and can be downloaded
+Graceful failure	If one API is down during a refresh, that series keeps its previously downloaded data and a note says so. If every API is down, the previous data are kept and the failure is logged. 🔌 Source status shows the result for each series
+Automatic weekly refresh
+
+The app refreshes itself in three ways that work together:
+
+Background scheduler. When the Streamlit server starts, one background thread is created for the whole server (not one per visitor). It checks every hour whether the saved data are 7 days old or more, and downloads fresh data if so. Nobody has to have the page open.
+Catch-up at page load. Some hosts suspend the server when nobody visits; Streamlit Community Cloud, for example, puts idle apps to sleep. If the data are already overdue when someone opens the page, the page refreshes them before drawing the charts.
+Open tabs update themselves. Every open browser tab checks every 15 minutes whether newer data have been saved and redraws if so. A dashboard left open on a screen therefore picks up the weekly update without a reload.
+
+Each download is saved to data_snapshot.json next to app.py. All visitors share that copy, and it survives server restarts, so the app does not download again on every visit or restart. The 7-day clock runs from the last successful download, so pressing Refresh data now also restarts the clock. The sidebar shows when the data were last refreshed, what triggered the refresh, and when the next automatic refresh is due.
+
+Hosting note. A scheduled refresh only runs while the server process is running. On a host that sleeps or restarts, step 2 makes the first visitor after the due date trigger the refresh. If you need a refresh exactly on time with no visitors, keep the app running continuously, for example on your own server with systemd, Docker restart: always, or a similar always-on setup.
+
 Calculations
 
 All formulas are applied in build_monthly_panel() in app.py.
@@ -89,7 +102,7 @@ Real GDP growth, % y/y	DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD	https://sdmx.o
 3-month interbank rate	DSD_STES@DF_FINMARK	https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES@DF_FINMARK,/KOR.M.IR3TIB.PA.....?startPeriod=1989-01
 Unemployment rate, 15+, s.a.	DSD_LFS@DF_IALFS_UNE_M	https://sdmx.oecd.org/public/rest/data/OECD.SDD.TPS,DSD_LFS@DF_IALFS_UNE_M,1.0/KOR.UNE_LF_M.PT_LF_SUB._Z.Y._T.Y_GE15._Z.M?startPeriod=1989-01
 
-Requests send Accept: application/vnd.sdmx.data+csv; charset=utf-8. The OECD rate-limits anonymous API use, so avoid pressing Refresh many times in a row. The 12-hour cache keeps normal use well within the limit.
+Requests send Accept: application/vnd.sdmx.data+csv; charset=utf-8. The OECD rate-limits anonymous API use, so avoid pressing Refresh many times in a row. Weekly automatic refreshes are well within the limit.
 
 World Bank – Indicators API v2 (api.worldbank.org)
 
@@ -110,12 +123,15 @@ File	Contents
 korea_macro_observations_<start>_to_<end>.csv	Long format: metric, period, date, value, units, frequency, calculated, source, method
 korea_macro_wide_<start>_to_<end>.csv	One row per month: S_krw_per_usd, P_kor_cpi, P_usa_cpi, i_3m_interbank_pct, unemployment_rate_pct, RER_* (both formulas, level and 2020 = 100 index), inflation_yoy_pct, real_rate_fisher_exact_pct, real_rate_approx_i_minus_pi_pct, real_gdp_growth_yoy_pct_quarterly, population_growth_pct_annual
 korea_<metric>_<start>_to_<end>.csv	The series shown in one chart
-refresh_log.csv	Timestamped log of data loads and refreshes
+refresh_log.csv	Timestamped log of every download (manual, scheduled or first run)
+data_snapshot.json	Saved copy of the latest download, created by the app. Delete it to force a full download on the next page load
 Customising
-Cache length: change CACHE_TTL_SECONDS in app.py.
+Refresh interval: weekly by default. Set the environment variable REFRESH_INTERVAL_DAYS to change it, e.g. REFRESH_INTERVAL_DAYS=1 streamlit run app.py for daily, or edit REFRESH_INTERVAL in app.py. SCHEDULER_CHECK_SECONDS (hourly) and SESSION_POLL (15 minutes) control how often the app checks.
 Earliest month: change FETCH_START (download start) and DEFAULT_START (first month you can select).
 Different series: edit the RAW_SOURCES dictionary. Each entry holds the exact API URL, so you can swap in, for example, OECD's long-term bond yield (IRLT) in place of IR3TIB.
 Troubleshooting
 "Some sources could not be loaded": one API timed out or rate-limited the request. Wait a minute, then press Refresh. The error text is shown in Source status and in the refresh log.
 Corporate proxy: requests respects the HTTPS_PROXY and REQUESTS_CA_BUNDLE environment variables.
+Weekly refresh did not happen on time: the server was probably asleep or stopped. The refresh runs as soon as someone opens the page; see the hosting note under Automatic weekly refresh.
+Read-only file system: the app still works. The saved data and the log are then kept in memory only, until the server restarts.
 Latest month differs between charts: each source has its own release schedule. GDP is quarterly and population is annual, so their latest observation is earlier than the monthly series.
